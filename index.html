@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Detector de Movimento — Câmera Frontal</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0b0b10; --fg: #e9eef3; --muted: #8a93a1; --accent: #4ade80; --warn: #f97316; --danger: #ef4444;
+      --card: #111827; --border: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; 
+      background: var(--bg); color: var(--fg);
+      min-height: 100dvh; display: grid; place-items: center; padding: 16px;
+    }
+    .app {
+      width: 100%; max-width: 720px; background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.25);
+    }
+    h1 { font-size: 1.2rem; margin: 0 0 10px; }
+    .video-wrap { position: relative; aspect-ratio: 3/4; background: #000; border-radius: 10px; overflow: hidden; }
+    video {
+      width: 100%; height: 100%; object-fit: cover;
+      transform: scaleX(-1); /* espelho para câmera frontal */
+    }
+    .status {
+      display: flex; align-items: center; gap: 10px; margin: 12px 0 0;
+    }
+    .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 0 transparent; transition: all .2s ease; }
+    .dot.moving { background: var(--danger); box-shadow: 0 0 0 4px rgba(239, 68, 68, .25); }
+    .stat { color: var(--muted); font-size: .95rem; }
+    .controls {
+      display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-top: 12px; align-items: center;
+    }
+    .control-line { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: .95rem; }
+    input[type="range"] { width: 100%; }
+    button {
+      border: 1px solid var(--border); background: #0f172a; color: var(--fg);
+      padding: 10px 14px; border-radius: 10px; cursor: pointer; font-weight: 600;
+    }
+    button.secondary { background: transparent; }
+    .hint { margin: 10px 0 0; color: var(--muted); font-size: .9rem; }
+    .error { color: var(--danger); margin-top: 10px; white-space: pre-wrap; }
+    .footer { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: .85rem; }
+    .pill { border: 1px dashed var(--border); padding: 6px 10px; border-radius: 999px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <h1>Detector de Movimento — Câmera Frontal</h1>
+
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+    </div>
+
+    <div class="status">
+      <div id="dot" class="dot" aria-hidden="true"></div>
+      <div class="stat" id="statusText">Aguardando permissão da câmera…</div>
+    </div>
+
+    <div class="controls">
+      <div class="control-line">
+        <label for="sens">Sensibilidade</label>
+        <input id="sens" type="range" min="0.5" max="3" step="0.1" value="1" />
+        <span id="sensVal" aria-live="polite">1.0×</span>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button id="toggleBtn">Iniciar</button>
+        <button id="switchBtn" class="secondary" title="Alternar câmera">Trocar</button>
+      </div>
+    </div>
+
+    <p class="hint">Dica: apoie o celular sobre uma superfície estável. Ajuste a sensibilidade se houver falsos positivos.</p>
+    <div id="error" class="error" role="alert" hidden></div>
+
+    <div class="footer">
+      <span class="pill">Necessário HTTPS (GitHub Pages funciona)</span>
+      <span class="pill">Compatível com Chrome/Edge modernos</span>
+      <span class="pill">Processamento local no navegador</span>
+    </div>
+  </div>
+
+  <script>
+    const els = {
+      video: document.getElementById('video'),
+      dot: document.getElementById('dot'),
+      status: document.getElementById('statusText'),
+      sens: document.getElementById('sens'),
+      sensVal: document.getElementById('sensVal'),
+      toggle: document.getElementById('toggleBtn'),
+      switchBtn: document.getElementById('switchBtn'),
+      error: document.getElementById('error'),
+    };
+
+    // Estado e parâmetros
+    let running = false;
+    let stream = null;
+    let useFront = true; // câmera frontal por padrão
+    const work = document.createElement('canvas');
+    const ctx = work.getContext('2d', { willReadFrequently: true });
+    let prev = null;
+
+    // Ajustes de detecção
+    const BASE_PIXEL_DIFF = 30;         // diferença média por pixel (0–255)
+    const BASE_PERCENT_THRESHOLD = 0.008; // % amostrada de pixels alterados para acionar movimento (0.8%)
+    let sensMult = 1;
+
+    function updateSensitivity() {
+      sensMult = parseFloat(els.sens.value || '1');
+      els.sensVal.textContent = sensMult.toFixed(1) + '×';
+    }
+    updateSensitivity();
+    els.sens.addEventListener('input', updateSensitivity);
+
+    // Inicia/para captura
+    els.toggle.addEventListener('click', async () => {
+      if (!running) {
+        await start();
+      } else {
+        stop();
+      }
+    });
+
+    // Alternar entre frontal / traseira
+    els.switchBtn.addEventListener('click', async () => {
+      useFront = !useFront;
+      if (running) {
+        await start(true); // reinicia trocando câmera
+      }
+    });
+
+    async function start(restarting = false) {
+      try {
+        if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+          throw new Error('Acesso à câmera requer HTTPS. Publique no GitHub Pages ou use http://localhost.');
+        }
+
+        els.error.hidden = true;
+        els.error.textContent = '';
+
+        // Para stream anterior, se existir
+        if (stream) {
+          stream.getTracks().forEach(t => t.stop());
+          stream = null;
+        }
+
+        const facing = useFront ? 'user' : 'environment';
+        const constraints = {
+          audio: false,
+          video: {
+            facingMode: { ideal: facing },
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          }
+        };
+
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        els.video.srcObject = stream;
+        await els.video.play();
+
+        // Espelho apenas para câmera frontal
+        els.video.style.transform = useFront ? 'scaleX(-1)' : 'none';
+
+        running = true;
+        prev = null;
+        els.toggle.textContent = 'Parar';
+        els.status.textContent = restarting ? 'Câmera trocada. Detectando…' : 'Câmera ativa. Detectando…';
+        loop();
+      } catch (err) {
+        running = false;
+        els.toggle.textContent = 'Iniciar';
+        els.status.textContent = 'Falha ao iniciar';
+        els.error.textContent = (err && err.message) ? err.message : String(err);
+        els.error.hidden = false;
+      }
+    }
+
+    function stop() {
+      running = false;
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      els.toggle.textContent = 'Iniciar';
+      els.status.textContent = 'Captura pausada';
+      els.dot.classList.remove('moving');
+    }
+
+    function loop() {
+      if (!running) return;
+      const v = els.video;
+      const w = v.videoWidth | 0;
+      const h = v.videoHeight | 0;
+      if (w === 0 || h === 0) {
+        requestAnimationFrame(loop);
+        return;
+      }
+      if (work.width !== w) {
+        work.width = w; work.height = h;
+      }
+      ctx.drawImage(v, 0, 0, w, h);
+      const curr = ctx.getImageData(0, 0, w, h);
+
+      let moving = false;
+      if (prev) {
+        // Amostragem: verifica ~1/4 dos pixels para economizar CPU
+        let changed = 0;
+        const data = curr.data;
+        const prevData = prev.data;
+        const step = 16; // 4 canais por pixel -> 16 bytes = 4 pixels
+        const totalSampled = data.length / step;
+
+        // thresholds ajustados pela sensibilidade (maior sens => thresholds menores)
+        const pixelDiffThresh = BASE_PIXEL_DIFF / sensMult;
+        const percentThresh = BASE_PERCENT_THRESHOLD / sensMult;
+
+        for (let i = 0; i < data.length; i += step) {
+          const dr = Math.abs(data[i]   - prevData[i]);
+          const dg = Math.abs(data[i+1] - prevData[i+1]);
+          const db = Math.abs(data[i+2] - prevData[i+2]);
+          const diff = (dr + dg + db) / 3;
+          if (diff > pixelDiffThresh) changed++;
+        }
+        const frac = changed / totalSampled;
+        moving = frac > percentThresh;
+
+        // UI mínima
+        if (moving) {
+          els.dot.classList.add('moving');
+          els.status.textContent = 'Movimento detectado';
+        } else {
+          els.dot.classList.remove('moving');
+          els.status.textContent = 'Monitorando…';
+        }
+      }
+      // Guarda quadro para próxima comparação
+      prev = curr;
+
+      // Ritmo: ~30–40 fps (usar rAF já é ok; se quiser reduzir CPU, use setTimeout)
+      requestAnimationFrame(loop);
+    }
+
+    // Tenta pré-inicializar permissões (não dispara sem gesto do usuário em alguns browsers)
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'camera' }).catch(() => {});
+    }
+  </script>
+</body>
+</html>
